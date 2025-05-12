@@ -46,25 +46,24 @@ def get_auth_token(client_id, client_secret, base_url):
          sys.exit(f"An unexpected error occurred during authentication: {exc}")
 
 def graphql_query(token, base_url, query, variables=None):
-    """Executes a GraphQL query against the Rubrik API."""
+    """Executes a GraphQL query against the Rubrik API. Raises exceptions on error."""
     headers = {"Authorization": f"Bearer {token}"}
     api_url = f"{base_url}/api/graphql"
     response = None 
     try:
         response = requests.post(api_url, json={"query": query, "variables": variables or {}}, headers=headers, timeout=120)
-        response.raise_for_status()
+        response.raise_for_status() # Raises HTTPError for 4xx/5xx
         result = response.json()
         if 'errors' in result and result['errors']:
             error_messages = [err.get('message', 'Unknown GraphQL error') for err in result['errors']]
             error_details = [str(err.get('extensions', '')) for err in result['errors']]
             full_error_message = "\n- ".join([f"{msg} {det}".strip() for msg, det in zip(error_messages, error_details)])
-            print(f"GraphQL API errors returned:\n- {full_error_message}") 
-            raise Exception(f"GraphQL API error: {full_error_message}") 
+            raise Exception(f"GraphQL API errors returned:\n- {full_error_message}")
         if 'data' not in result and not (result.get('errors')):
              print(f"Warning: No 'data' key in GraphQL response and no errors. Full response: {json.dumps(result, indent=2)}")
              return {} 
         return result.get("data", {})
-    except requests.HTTPError as exc:
+    except requests.HTTPError as exc: 
         response_text = "(No response object available)"; response_status = "N/A"
         error_response_obj = exc.response if exc.response is not None else response
         if error_response_obj is not None:
@@ -73,15 +72,17 @@ def graphql_query(token, base_url, query, variables=None):
              except json.JSONDecodeError:
                  try: response_text = error_response_obj.text
                  except Exception: response_text = "(Failed to read response body)"
-             except Exception as e: response_text = f"(Error processing response body: {e})"
+             except Exception as e_parse: response_text = f"(Error processing response body: {e_parse})"
         raise Exception(f"GraphQL HTTP error: {exc}\nResponse body (Status: {response_status}):\n{response_text}")
-    except requests.exceptions.Timeout: raise Exception(f"GraphQL request timed out accessing {api_url}")
-    except requests.exceptions.RequestException as exc: raise Exception(f"GraphQL network error (non-HTTP): {exc}")
+    except requests.exceptions.Timeout: 
+        raise Exception(f"GraphQL request timed out accessing {api_url}")
+    except requests.exceptions.RequestException as exc: 
+        raise Exception(f"GraphQL network error (non-HTTP): {exc}")
     except json.JSONDecodeError as exc_json:
         status_code = "N/A"; resp_text = "(Response object not available)"
         if response is not None: status_code = response.status_code; resp_text = (response.text[:500] + '...') if len(response.text) > 500 else response.text
         raise Exception(f"GraphQL error: Could not decode JSON response. Status: {status_code}. Excerpt:\n{resp_text}\nOriginal: {exc_json}")
-    except Exception as exc:
+    except Exception as exc: 
          raise Exception(f"An unexpected error occurred during GraphQL query: {exc}")
 
 def get_all_paginated_nodes(token, base_url, query_string, variables, connection_path_keys):
@@ -151,7 +152,7 @@ def get_latest_oracle_snapshot(token, base_url, oracle_db_id):
 def get_oracle_hosts_for_cluster(token, base_url, cluster_id_to_filter):
     query=''' query GetOracleHosts($filters: [Filter!], $first: Int, $after: String) { oracleTopLevelDescendants( filter: $filters, first: $first, after: $after ){ nodes{ id name objectType cluster{id name} } pageInfo { hasNextPage endCursor } } }'''
     initial_vars = { "filters": [ {"field": "IS_RELIC", "texts": ["false"]}, {"field": "IS_REPLICATED", "texts": ["false"]} ] }
-    print(f"Querying all Oracle top-level descendants (paginated). Will filter for cluster '{cluster_id_to_filter}' client-side...")
+    print(f"Querying Oracle top-level descendants (paginated). Will filter for cluster '{cluster_id_to_filter}' client-side...")
     all_descendants = get_all_paginated_nodes(token, base_url, query, initial_vars, ['oracleTopLevelDescendants'])
     hosts = []
     if not all_descendants: print("No Oracle top-level descendants returned."); return []
@@ -170,61 +171,25 @@ def validate_oracle_db_backup(token, base_url, oracle_db_id, snapshot_id, host_i
     if not validation_response or not validation_response.get('id'): raise Exception(f"Failed to initiate Oracle validation. Resp: {validation_response}")
     return validation_response
 
-# --- MODIFIED wait_for_oracle_job Function ---
 def wait_for_oracle_job(token, base_url, job_id, cluster_uuid):
-    """
-    Polls the status of an Oracle async job. Polling interval set to 5 seconds.
-    Returns True if SUCCEEDED, False otherwise (FAILED, CANCELED, TIMEOUT).
-    """
-    query = ''' 
-    query GetOracleAsyncStatus($id: String!, $clusterUuid: String!) { 
-      oracleDatabaseAsyncRequestDetails(input:{id:$id, clusterUuid:$clusterUuid}) { 
-        progress 
-        status 
-        error { message } 
-      } 
-    }'''
+    query = ''' query GetOracleAsyncStatus($id: String!, $clusterUuid: String!) { oracleDatabaseAsyncRequestDetails(input:{id:$id, clusterUuid:$clusterUuid}) { progress status error { message } } }'''
     variables = { "id": job_id, "clusterUuid": cluster_uuid }
-    
-    poll_interval_seconds = 5  # Changed polling interval
-    max_oracle_checks = 120    # Adjusted for ~10 minute timeout (120 * 5s = 600s)
-    
-    print(f"Monitoring Oracle job ID: {job_id} on cluster: {cluster_uuid} (checking every {poll_interval_seconds}s)...")
-
+    poll_interval_seconds = 5; max_oracle_checks = 120    
+    print(f"Monitoring Oracle job ID: {job_id} (cluster: {cluster_uuid}, every {poll_interval_seconds}s)...")
     for check_count in range(max_oracle_checks):
         try:
             data_root = graphql_query(token, base_url, query, variables)
             job_details = data_root.get('oracleDatabaseAsyncRequestDetails')
-
-            if not job_details:
-                status = "UNKNOWN" 
-                progress = 0       
-                print(f"Warning: Could not retrieve details for Oracle job {job_id}. Polling attempt {check_count + 1}/{max_oracle_checks}.")
-            else:
-                status = job_details.get('status', "UNKNOWN").upper() 
-                progress = job_details.get('progress', 0)
-            
-            print(f"  [{time.strftime('%H:%M:%S')}] Poll {check_count + 1}/{max_oracle_checks}: Status = {status}, Progress = {progress if status != 'UNKNOWN' else 'N/A'}%")
-
-            if status == "SUCCEEDED":
-                print("✅ Oracle DB backup validation job SUCCEEDED.")
-                return True
-            elif status in ["FAILED", "FAILURE"]: 
-                error_msg = job_details.get('error', {}).get('message', 'Unknown error') if job_details else 'Failed to get job details'
-                print(f"❌ Oracle DB backup validation job FAILED: {error_msg}")
-                return False
-            elif status in ["CANCELLED", "CANCELED"]:
-                print(f"Oracle DB backup validation job was {status}.")
-                return False
-        except Exception as e:
-            print(f"Warning: Exception during Oracle job poll: {e}. Attempt {check_count+1}.")
-        
-        if check_count < max_oracle_checks - 1:
-            time.sleep(poll_interval_seconds)
-    
-    print(f"❌ Oracle DB backup validation job (ID: {job_id}) timed out after {max_oracle_checks * poll_interval_seconds} seconds.")
-    return False
-# --- END MODIFIED wait_for_oracle_job Function ---
+            status = "UNKNOWN"; progress = 0
+            if job_details: status = job_details.get('status', "UNKNOWN").upper(); progress = job_details.get('progress', 0)
+            else: print(f"Warning: Could not retrieve details for Oracle job {job_id}. Attempt {check_count+1}.")
+            print(f"  [{time.strftime('%H:%M:%S')}] Poll {check_count+1}/{max_oracle_checks}: Status = {status}, Progress = {progress if status!='UNKNOWN' else 'N/A'}%")
+            if status == "SUCCEEDED": print("✅ Oracle DB validation job SUCCEEDED."); return True
+            elif status in ["FAILED", "FAILURE"]: print(f"❌ Oracle DB validation FAILED: {job_details.get('error',{}).get('message','N/A') if job_details else 'No details'}"); return False
+            elif status in ["CANCELLED", "CANCELED"]: print(f"Oracle DB validation job {status}."); return False
+        except Exception as e: print(f"Warning: Exception during Oracle job poll: {e}. Attempt {check_count+1}.")
+        if check_count < max_oracle_checks - 1: time.sleep(poll_interval_seconds)
+    print(f"❌ Oracle DB validation job timed out: {job_id}"); return False
 
 # --- Hyper-V Functions ---
 def get_protected_connected_hyperv_vms(token, base_url):
@@ -314,20 +279,55 @@ def find_hyperv_mount_id(token, base_url, mounted_vm_name_to_find, source_vm_fid
     if not mount_id: print(f"Error: Found mount for '{mounted_vm_name_to_find}' but missing 'id'."); return None
     return mount_id
 
-def unmount_vm(token, base_url, mount_id):
-    mutation = """ mutation HyperVUnmount($input: DeleteHypervVirtualMachineSnapshotMountInput!) { deleteHypervVirtualMachineSnapshotMount(input: $input) { id status error { message } } } """
-    variables = {"input": {"id": mount_id, "force": True}}
+# --- MODIFIED unmount_vm Function (with Retries) ---
+def unmount_vm(token, base_url, mount_id, max_retries=3, retry_delay_seconds=10):
+    """
+    Unmounts a Hyper-V Live Mount using its specific mount ID.
+    Retries on failure up to 'max_retries' times with a delay.
+    Returns True on successful initiation, False otherwise.
+    """
+    mutation = """
+    mutation HyperVUnmount($input: DeleteHypervVirtualMachineSnapshotMountInput!) {
+      deleteHypervVirtualMachineSnapshotMount(input: $input) {
+        id       # ID of the asynchronous task created for the unmount
+        status   # Initial status of the unmount task (e.g., QUEUED, RUNNING)
+        error { message } 
+      }
+    }"""
+    variables = {"input": {"id": mount_id, "force": True}} 
     print(f"\nAttempting to unmount Hyper-V mount ID: {mount_id}...")
-    try:
-        data = graphql_query(token, base_url, mutation, variables)
-        result = data.get('deleteHypervVirtualMachineSnapshotMount')
-        if not result: print("Error: Empty response for unmount."); return False
-        mutation_error = result.get('error')
-        if mutation_error and mutation_error.get('message'): print(f"Error from unmount: {mutation_error['message']}"); return False
-        unmount_task_id = result.get('id')
-        if unmount_task_id: print(f"Unmount task initiated. Task ID: {unmount_task_id}, Status: {result.get('status')}"); return True
-        else: print(f"Warning: Unmount successful/pending but no task ID. Resp: {json.dumps(result, indent=2)}"); return True
-    except Exception as e: print(f"Unexpected error during unmount API call: {e}"); return False
+    for attempt in range(max_retries):
+        print(f"--- Unmount Attempt {attempt + 1}/{max_retries} for mount ID {mount_id} ---")
+        # print(f"--- [DEBUG unmount_vm] Sending unmount mutation with variables: {json.dumps(variables, indent=2)} ---")
+        try:
+            data = graphql_query(token, base_url, mutation, variables)
+            result = data.get('deleteHypervVirtualMachineSnapshotMount')
+            if not result:
+                print(f"Attempt {attempt + 1}: Received empty response for unmount mutation.")
+            else:
+                mutation_error = result.get('error')
+                if mutation_error and mutation_error.get('message'):
+                    print(f"Attempt {attempt + 1}: Error from unmount mutation: {mutation_error.get('message')}")
+                else:
+                    unmount_task_id = result.get('id') 
+                    initial_task_status = result.get('status')
+                    if unmount_task_id:
+                        print(f"✅ Unmount task successfully initiated on attempt {attempt + 1}.")
+                        print(f"   Task ID: {unmount_task_id}, Initial Status: {initial_task_status}")
+                        return True 
+                    else:
+                        print(f"Attempt {attempt + 1}: Warning: Unmount initiated but no task ID. Response: {json.dumps(result, indent=2)}")
+                        return True 
+        except Exception as e: 
+            print(f"Attempt {attempt + 1}: Error during unmount API call: {e}")
+        if attempt < max_retries - 1:
+            print(f"Unmount attempt {attempt + 1} failed. Retrying in {retry_delay_seconds} seconds...")
+            time.sleep(retry_delay_seconds)
+        else:
+            print(f"❌ All {max_retries} unmount attempts failed for mount ID {mount_id}.")
+            return False 
+    return False 
+# --- END MODIFIED unmount_vm Function ---
 
 # --- Main Execution Logic ---
 def main():
@@ -372,7 +372,7 @@ def main():
             if not display_dbs : raise Exception("No Oracle DBs to display.")
             print("\nAvailable Oracle Databases:"); [print(f" {i+1:>2}) {db.get('name','N/A')} (Cluster: {db.get('cluster',{}).get('name','N/A')}, SLA: {db.get('effectiveSlaDomain',{}).get('name','N/A')})") for i,db in enumerate(display_dbs)]
             selected_db_obj = None
-            while selected_db_obj is None: # Corrected VM selection loop from previous version
+            while selected_db_obj is None:
                 try:
                     db_choice_input = input(f"Select Oracle DB (1-{len(display_dbs)}): ")
                     db_choice_idx = int(db_choice_input) - 1
@@ -399,7 +399,7 @@ def main():
             if not display_hosts: raise Exception("No Oracle hosts/RACs to display.")
             print("\nAvailable Oracle Hosts/RACs:"); [print(f" {i+1:>2}) {h.get('name','N/A')} (Type: {h.get('objectType','N/A')})") for i,h in enumerate(display_hosts)]
             selected_host_obj = None
-            while selected_host_obj is None: # Corrected Host selection loop from previous version
+            while selected_host_obj is None: 
                 try:
                     host_choice_input = input(f"Select Oracle Host/RAC (1-{len(display_hosts)}): ")
                     host_choice_idx = int(host_choice_input) - 1
@@ -438,7 +438,7 @@ def main():
             print("\nAvailable VMs for selection:")
             for i, v_item in enumerate(display_vms): sla_info=v_item.get('effectiveSlaDomain',{}); cluster_info=v_item.get('cluster',{}); print(f" {i+1:>2}) {v_item.get('name','N/A')} (Cluster: {cluster_info.get('name','N/A')})")
             selected_vm=None 
-            while selected_vm is None: # Corrected VM selection loop
+            while selected_vm is None: 
                 try:
                     vm_choice_input = input(f"Select VM (1-{len(display_vms)}): "); vm_choice_idx = int(vm_choice_input) - 1
                     if 0 <= vm_choice_idx < len(display_vms): selected_vm = display_vms[vm_choice_idx]
@@ -463,7 +463,7 @@ def main():
             if not display_hosts: print("No hosts to display."); sys.exit(0)
             print("\nAvailable Hosts:")
             for i,h_item in enumerate(display_hosts): print(f" {i+1:>2}) {h_item.get('name','N/A')} (ID: {h_item.get('id')})")
-            selected_host=None # Corrected Host selection loop
+            selected_host=None 
             while selected_host is None:
                  try:
                      host_choice_input = input(f"Select Host (1-{len(display_hosts)}): "); host_choice_idx = int(host_choice_input) - 1
