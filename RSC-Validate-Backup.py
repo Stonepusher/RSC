@@ -52,7 +52,7 @@ def graphql_query(token, base_url, query, variables=None):
     response = None 
     try:
         response = requests.post(api_url, json={"query": query, "variables": variables or {}}, headers=headers, timeout=120)
-        response.raise_for_status() # Raises HTTPError for 4xx/5xx
+        response.raise_for_status() 
         result = response.json()
         if 'errors' in result and result['errors']:
             error_messages = [err.get('message', 'Unknown GraphQL error') for err in result['errors']]
@@ -279,59 +279,31 @@ def find_hyperv_mount_id(token, base_url, mounted_vm_name_to_find, source_vm_fid
     if not mount_id: print(f"Error: Found mount for '{mounted_vm_name_to_find}' but missing 'id'."); return None
     return mount_id
 
-# --- MODIFIED unmount_vm Function (with Retries) ---
 def unmount_vm(token, base_url, mount_id, max_retries=3, retry_delay_seconds=10):
-    """
-    Unmounts a Hyper-V Live Mount using its specific mount ID.
-    Retries on failure up to 'max_retries' times with a delay.
-    Returns True on successful initiation, False otherwise.
-    """
-    mutation = """
-    mutation HyperVUnmount($input: DeleteHypervVirtualMachineSnapshotMountInput!) {
-      deleteHypervVirtualMachineSnapshotMount(input: $input) {
-        id       # ID of the asynchronous task created for the unmount
-        status   # Initial status of the unmount task (e.g., QUEUED, RUNNING)
-        error { message } 
-      }
-    }"""
+    mutation = """ mutation HyperVUnmount($input: DeleteHypervVirtualMachineSnapshotMountInput!) { deleteHypervVirtualMachineSnapshotMount(input: $input) { id status error { message } } } """
     variables = {"input": {"id": mount_id, "force": True}} 
     print(f"\nAttempting to unmount Hyper-V mount ID: {mount_id}...")
     for attempt in range(max_retries):
         print(f"--- Unmount Attempt {attempt + 1}/{max_retries} for mount ID {mount_id} ---")
-        # print(f"--- [DEBUG unmount_vm] Sending unmount mutation with variables: {json.dumps(variables, indent=2)} ---")
         try:
             data = graphql_query(token, base_url, mutation, variables)
             result = data.get('deleteHypervVirtualMachineSnapshotMount')
-            if not result:
-                print(f"Attempt {attempt + 1}: Received empty response for unmount mutation.")
+            if not result: print(f"Attempt {attempt + 1}: Empty response for unmount.")
             else:
                 mutation_error = result.get('error')
-                if mutation_error and mutation_error.get('message'):
-                    print(f"Attempt {attempt + 1}: Error from unmount mutation: {mutation_error.get('message')}")
+                if mutation_error and mutation_error.get('message'): print(f"Attempt {attempt + 1}: Error from unmount: {mutation_error.get('message')}")
                 else:
-                    unmount_task_id = result.get('id') 
-                    initial_task_status = result.get('status')
-                    if unmount_task_id:
-                        print(f"✅ Unmount task successfully initiated on attempt {attempt + 1}.")
-                        print(f"   Task ID: {unmount_task_id}, Initial Status: {initial_task_status}")
-                        return True 
-                    else:
-                        print(f"Attempt {attempt + 1}: Warning: Unmount initiated but no task ID. Response: {json.dumps(result, indent=2)}")
-                        return True 
-        except Exception as e: 
-            print(f"Attempt {attempt + 1}: Error during unmount API call: {e}")
-        if attempt < max_retries - 1:
-            print(f"Unmount attempt {attempt + 1} failed. Retrying in {retry_delay_seconds} seconds...")
-            time.sleep(retry_delay_seconds)
-        else:
-            print(f"❌ All {max_retries} unmount attempts failed for mount ID {mount_id}.")
-            return False 
+                    unmount_task_id = result.get('id'); initial_task_status = result.get('status')
+                    if unmount_task_id: print(f"✅ Unmount task initiated (Attempt {attempt+1}). ID: {unmount_task_id}, Status: {initial_task_status}"); return True 
+                    else: print(f"Attempt {attempt+1}: Warning: Unmount initiated, no task ID. Resp: {json.dumps(result, indent=2)}"); return True 
+        except Exception as e: print(f"Attempt {attempt + 1}: Error during unmount API call: {e}")
+        if attempt < max_retries - 1: print(f"Unmount attempt {attempt + 1} failed. Retrying in {retry_delay_seconds}s..."); time.sleep(retry_delay_seconds)
+        else: print(f"❌ All {max_retries} unmount attempts failed for {mount_id}."); return False 
     return False 
-# --- END MODIFIED unmount_vm Function ---
 
 # --- Main Execution Logic ---
 def main():
-    parser = argparse.ArgumentParser(description="Rubrik Backup Validator: Live Mount & Unmount Utility.")
+    parser = argparse.ArgumentParser(description="Rubrik Backup Validator.")
     parser.add_argument("--workflow", choices=["hyperv", "oracle"], type=str.lower, help="Specify workflow: 'hyperv' or 'oracle'.")
     args = parser.parse_args()
 
@@ -355,7 +327,7 @@ def main():
 
     exit_code = 1; mount_id_to_unmount = None; mount_task_final_state = None
     
-    if selection == "1": # Oracle Workflow
+    if selection == "1": 
         print("\n--- Oracle DB Backup Validation ---")
         try:
             all_oracle_dbs = get_protected_oracle_dbs(token, config['RUBRIK_BASE_URL'])
@@ -496,20 +468,38 @@ def main():
                 if mount_task_final_state is None and i < max_checks - 1: print(f"  Waiting {wait_seconds}s..."); time.sleep(wait_seconds)
             else: 
                  if mount_task_final_state is None: mount_task_final_state = "TIMEOUT"; print("❌ Error: Mount task polling timed out.")
+            
             if mount_task_final_state == 'SUCCEEDED':
-                print("\nMount task SUCCEEDED."); print("Waiting before querying mount ID..."); time.sleep(10)
+                print("\nMount task SUCCEEDED.")
+                exit_code = 0 # Mount operation succeeded
+                print("Waiting before querying mount ID..."); time.sleep(10)
                 mount_id_to_unmount = find_hyperv_mount_id(token, config['RUBRIK_BASE_URL'], mount_vm_name, selected_vm_id)
-                if not mount_id_to_unmount: print(f"⚠️ CRITICAL: Mount SUCCEEDED, but Mount ID for '{mount_vm_name}' not found. MANUAL UNMOUNT REQUIRED."); exit_code = 1
-            else: print(f"\n❌ Mount task failed (State: {mount_task_final_state})."); exit_code = 1
-        except Exception as e: print(f"\n❌ Error during Hyper-V mount process: {e}"); exit_code = 1 
+                if not mount_id_to_unmount: 
+                     print(f"⚠️ CRITICAL Warning: Mount SUCCEEDED, but Mount ID for '{mount_vm_name}' not found. MANUAL UNMOUNT REQUIRED.")
+                     # Even if we can't find mount_id for cleanup, primary operation succeeded.
+            else: 
+                print(f"\n❌ Mount task did not succeed (Final State: {mount_task_final_state}).")
+                exit_code = 1 # Mount itself failed
+
+        except Exception as e: 
+             print(f"\n❌ An error occurred during the Hyper-V mount process: {e}")
+             exit_code = 1 
+        
         if mount_id_to_unmount:
             print("\n--- Initiating Unmount ---")
             unmount_initiated = unmount_vm(token, config['RUBRIK_BASE_URL'], mount_id_to_unmount)
-            if unmount_initiated: print("✅ Unmount initiated."); exit_code = 0 if mount_task_final_state == 'SUCCEEDED' and exit_code != 1 else 1 
-            else: print("❌ Error during unmount initiation."); exit_code = 1
-        elif mount_task_final_state == 'SUCCEEDED' and not mount_id_to_unmount: print("Skipping unmount: Mount ID not found."); 
-        elif mount_task_final_state != 'SUCCEEDED': print(f"Skipping unmount: Mount task state {mount_task_final_state}."); 
-    
+            if unmount_initiated:
+                print("✅ Unmount initiated successfully.")
+                # exit_code is already 0 if mount succeeded.
+            else:
+                print("❌ Error during unmount initiation. Manual cleanup may be required.")
+                if exit_code == 0: # If mount was successful, but unmount init failed
+                    print("  (Note: Mount was successful. Unmount initiation failed. Script result reflects mount success.)")
+        elif mount_task_final_state == 'SUCCEEDED' and not mount_id_to_unmount:
+             print("Skipping unmount: Mount task SUCCEEDED, but Mount ID could not be determined for cleanup. Manual unmount may be required.")
+        elif mount_task_final_state != 'SUCCEEDED':
+             print(f"Skipping unmount because mount task did not complete successfully (State: {mount_task_final_state}).")
+             
     print(f"\n--- Script finished with exit code {exit_code} ---")
     sys.exit(exit_code)
 
